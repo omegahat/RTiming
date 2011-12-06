@@ -1,0 +1,412 @@
+<?xml version="1.0"?>
+<article xmlns:r="http://www.r-project.org"
+         xmlns:c="http://www.C.org"
+         xmlns:i="http://www.statdocs.org/interactive"
+>
+
+<articleinfo>
+
+    <author>
+     <firstname>Duncan</firstname>
+     <surname>Temple Lang</surname>
+    </author>
+
+    <title>An experiment in using pre-allocated memory across R expressions to improve efficiency</title>
+     <titleabbrev>Using pre-allocated buffers</titleabbrev>
+
+</articleinfo>
+<!--
+ <info>
+  <title>An experiment in using pre-allocated memory across R expressions to improve efficiency</title>
+  <subtitle></subtitle>
+    <author><personname>
+     <firstname>Duncan</firstname>
+     <surname>Temple Lang</surname>
+     </personname></author>
+   <address><email>duncan@wald.ucdavis.edu</email></address>
+ </info>
+
+-->
+
+<section>
+<title>The Simple Problem</title>
+<para>
+This example is intended to test the benefit of using a preallocated
+"working buffer" for calculations. The goal is to avoid R's copying of
+objects.  It came from separate conversations with both Henrik Bengstsson and Jim
+Bullard.  Jim is looking at trying to identify programmatically cases
+where we can rewrite code to use this approach. This experiment is a test
+before we do that to see what gains we achieve.
+</para>
+
+<r:code output="false">
+library(RTiming)
+</r:code>
+<invisible>
+<r:codeIds>
+validate
+settings
+run2
+compare
+</r:codeIds>
+</invisible>
+<invisible>
+<r:run>
+file = "tests/buffer.xml"
+xmlSource(file, xnodes = "//r:function")
+xmlSource(file, ids = "validate")
+
+xmlSource(file, ids = c("settings", "run2", "compare"))
+</r:run>
+</invisible>
+
+<para>
+Let's start with a very simple, naieve function.
+<r:function>
+g =
+function(n, B = 10)
+{
+  ans = c()
+  for(i in 1:B) {
+      m = matrix(rnorm(n*n), n, n)      
+      ans = c(ans, sum(m[sample(1:n, 1),]))
+  }
+
+  ans
+}
+</r:function>
+This repeats B times a simple calculation which generates an n by n
+matrix filled with random numbers from an Normal distribution and then
+selects a row at random and sums the values.  There are so many ways
+to avoid the extra calculations. This is not the point of our
+example. It is to see how we can avoid allocating a lot of memory.
+</para>
+
+<para>
+There are several improvements we can see as humans looking at the
+entire function.  Firstly, we can identify that the result
+<r:var>ans</r:var> can be preallocated as a numeric vector of length
+<r:var>B</r:var> ahead of time.  Secondly, instead of creating a new
+matrix each and every time, we can allocate the space once, before
+entering the loop. Then we can reuse that space and insert the newly
+generated values from <r:func>rnorm</r:func> into that vector.  We use
+the C routine <c:routine>R_set_numeric_matrix</c:routine> to do this,
+giving it the previously allocated space and the new values.
+And also when extracting the sampled row, we put the
+result into a previously allocated space that is constructed
+just once.  Note that we use <code lang="r">DUP = FALSE</code>
+to avoid copying the R objects. 
+<r:function>
+g.rewrite =
+function(n, B = 10)
+{
+  n = as.integer(n)
+  ans = numeric(B)
+  m = matrix(0, n, n)
+  buf = numeric(n)
+  n.squared = n * n
+  for(i in 1:B) {
+      .Call("R_set_numeric_matrix", m, n, n, rnorm(n.squared), DUP = FALSE)
+      offset = sample(1:n, 1)
+      .Call("R_set_numeric_buffer_from_matrix_row", buf, m, 
+                     as.integer(offset - 1), n, n, DUP = FALSE)
+      ans[i] = sum(buf)
+  }
+
+  ans
+}
+</r:function>
+</para>
+
+
+<para>
+This version adds one extra attempt at efficiency.
+Instead of calling <r:func>rnorm</r:func> and having it allocate
+the same amount of space each time and putting the values into our matrix, 
+we can use the matrix's space directly.
+We write our own wrapper for rnorm and use this, passing it the
+internal array of double elements from the matrix <r:var>m</r:var>.
+Again, we use <code lang="r">DUP = FALSE</code>.
+<r:function>
+g.rnorm.rewrite =
+function(n, B = 10)
+{
+  n = as.integer(n)
+  ans = numeric(B)
+  m = matrix(0, n, n)
+  buf = numeric(n)
+  n.squared = n * n
+  for(i in 1:B) {
+      .C("R_rnorm", n.squared, 0, 1, m, DUP = FALSE)
+      offset = sample(1:n, 1)
+      .Call("R_set_numeric_buffer_from_matrix_row", buf, m, 
+                    as.integer(offset - 1), n, n, DUP = FALSE)
+      ans[i] = sum(buf)
+  }
+
+  ans
+}
+</r:function>
+</para>
+
+<para>
+At this point, we have three functions which we expect to be progressively
+faster as they make use of previously allocated memory that is done just
+once. Before we time the different functions, we want to make certain
+that they return the same values. There is little point in
+comparing their performance if they do different things!.
+So this code calls each function, making certain that the
+random seed is reset to ensure that we are using the
+random number generator in the same state.
+<r:test id="validate">
+set.seed(1234)
+a = g(30)
+
+library(RTiming)
+set.seed(1234)
+b = g.rewrite(30)
+
+set.seed(1234)
+c = g.rnorm.rewrite(30)
+
+all.equal(a, b)
+all.equal(a, c)
+</r:test>
+</para>
+
+<para>
+Now we are ready to compare the performance of the different functions.
+We will  work with different size matrices and look at the results 
+for these different inputs.  We will measure the time taken
+and to get more reliable estimates of the times, we repeat
+the top-level R  operation N times and within each function
+call, we repeat the sampling procedure B times.
+As B increases, we are amortizing the allocation across
+more uses.
+And as N increases, we should be getting more accurate estimates of time.
+<r:init id="settings">
+<i:object type="app/x-R-spinbox" var="B" rtype="integer" min="1" max="4000" />
+<i:object type="app/x-R-spinbox" var="N" rtype="integer" min="1" max="4000" />
+
+N = 10
+B = 10
+</r:init>
+</para>
+
+
+<invisible>
+<para>
+We ignore this run. Instead
+<r:code id="run" eval="false">
+sizes = 10^(1:4)
+sizes = c(1, 10, 50, 100, 1000, 2000, 3000, 4000, 5000)
+
+g.times = lapply(sizes, function(n) system.time(g(n, B))[1:3,] )
+g.rewrite.times = lapply(sizes, function(n) system.time(g.rewrite(n, B))[1:3,] )
+
+times =
+data.frame(times = c(unlist(g.times), unlist(g.rewrite.times)),
+           sizes = rep(sizes, rep(3, length(sizes))),
+           operation = factor(rep(c("original", "rewrite"), rep(3*length(sizes), 2))),
+           timing = factor( rep(c("user", "sys", "elapsed"), length(sizes))))
+
+library(lattice)
+xyplot(times ~ sizes, times, group = operation, subset = timing == "elapsed", auto.key = list(columns = 2))
+</r:code>
+</para>
+</invisible>
+
+
+Here we run with different sizes and run for all three functions.
+
+<invisible>
+<para>
+This is the start of an attempt to measure the number of garbage
+collections during the evaluation of an expression, along with the
+regular results from system.time.
+<r:code eval="false"><![CDATA[
+system.time = function(expr) {
+ count = 0
+ f = function(...) 
+   count <<- count + 1
+
+ gcHook(f)
+ c(base::system.time()[1:3], count)
+}
+]]></r:code>
+</para>
+</invisible>
+
+<para>
+This is the code for our main test.
+We specify a vector of matrix sizes, i.e. values for <r:var>n</r:var>
+<r:code id="run2" showResult="false" cache="">
+sizes = seq(5, by = 20, length = 10)
+#sizes = c(1, 10, 50, 100, 1000, 2000)
+sizes = c(2, 10, 30)
+#sizes = c(1, seq(50, by = 50, length = 20), 2000, 3000) 
+</r:code>
+
+Then we call each function <r:var>N</r:var> times
+for each value of <r:var>n</r:var>. 
+We end up with the user, system and elapsed times for each of the 
+<r:var>N</r:var> runs for each value of <r:var>n</r:var>
+for each function.
+<r:code output="false">
+times =
+lapply(c(g, g.rewrite, g.rnorm.rewrite),
+          function(fun) {
+	       lapply(sizes, function(n) { 
+                                print(n)
+                                replicate(N, system.time(fun(n, B)))[1:3,] 
+                             })
+          }
+          )
+</r:code>
+<ignore>
+<r:code eval="false">
+g.rtimes = lapply(sizes, function(n) { print(n); replicate(N, system.time(g(n, B)))[1:3,] })
+g.rewrite.rtimes = lapply(sizes, function(n) { print(n) ; replicate(N, system.time(g.rewrite(n, B)))[1:3, ]})
+g.rnorm.rewrite.rtimes = lapply(sizes, function(n) {print(n) ; replicate(N, system.time(g.rnorm.rewrite(n, B)))[1:3, ]})
+</r:code>
+</ignore>
+
+
+Then we arrange these timing measurements into a data frame and 
+create parallel variables to identify the associated
+value of <r:var>n</r:var>, function and what type of timing measurement.
+<r:code output="false">
+rtimes =
+   data.frame(times = unlist(times), 
+              sizes = rep(rep(sizes, rep(N*3, length(sizes))), 3),
+              operation = factor(rep(c("original", "rewrite", "rnorm.rewrite"), 
+                                  rep(N*3*length(sizes), 3))),
+              timing = factor( rep(c("user", "sys", "elapsed"),
+                                  N*length(sizes)*3)))
+</r:code>
+
+And now we can look at a plot of total elapsed time versus matrix size
+in <xref linkend="sizeVtimes"/>.
+And we of course see that the time goes up with vector size and non-linearly.
+And we also see that as matrix size increases the algorithm start to separate
+from each other in terms of timings, and the functions perform as we expected
+in terms of their ordering.
+<figure id="sizeVtimes">
+<title>Times for Sizes N = <r:expr>N</r:expr>, B = <r:expr>B</r:expr></title>
+<!-- for the interactive component, we may just want to inline R code here
+    as it may be more direct.
+  w = wxChoice(parser$GetWindow(), wxID_ANY, wxDefaultPosition, wxDefaultSize, choices = levels(times$timing))
+  w$AddCallback(wxEVT_COMMAND_CHOICE_SELECTED, 
+                  function() {
+		     xyplot(times ~ sizes, rtimes, group = operation, 
+		               subset = timing == time.type, auto.key = list(columns = 3))
+                  })
+  w
+
+ But we do have to get the environment of the function right.
+ -->
+<r:plot>
+<i:object type="app/x-R-choice">
+<choices><r:code>levels(times$timing)</r:code></choices>
+<action>
+xyplot(times ~ sizes, rtimes, group = operation, 
+        subset = timing == time.type, auto.key = list(columns = 3))
+</action>
+</i:object>
+library(lattice)
+xyplot(times ~ sizes, rtimes, group = operation, 
+        subset = timing == "elapsed", auto.key = list(columns = 3))
+</r:plot>
+</figure>
+</para>
+
+<para>
+We write a simple function that takes the timings
+for two of the function runs and computes the
+ratio of the times based on the elapsed time.
+It takes the median for each of the N runs
+and then plots the pairs of ratios.
+This returns a data frame with the vector sizes
+and the elapsed time ratio.
+<r:function id="compareTimes">
+compareTimes  =
+function(a, b, sizes, statistic = "Median", ...)
+{
+  a = sapply(a, function(x) summary(x[3,])[statistic])
+  b = sapply(b, function(x) summary(x[3,])[statistic])
+
+  r = range(c(a, b))
+  plot(a, b, ..., xlim = r, ylim = r)
+  text(a, b, labels = sizes, col = "red", adj = -.5)
+  axis(3, a, labels = sizes)
+
+  abline(coef = c(0,1))
+  data.frame(n = sizes, ratio = a/b)
+}
+</r:function>
+We could do this with the data frame and plot the ratios
+for all three functions, or at least A with B and A with C.
+</para>
+
+<para>
+We use this function to compare the slowest with the next slowest.
+<r:plot id="compare">
+f = compareTimes(times[[2]], times[[1]], sizes, "Median", 
+                   xlab = "Regular", ylab = "Rewrite")
+</r:plot>
+</para>
+<para>
+
+And then we compare the naieve/slow function to what should be the fastest.
+<r:plot>
+f = compareTimes(times[[3]], times[[1]], sizes, "Median", 
+                   xlab = "Regular", ylab = "Rewrite")
+</r:plot>
+</para>
+<para>
+
+And finally, we plot the ratios against the matrix size.
+<figure>
+<title>Ratio of Slow to Fast</title>
+<r:plot>
+plot(f) # speed ratio versus n
+</r:plot>
+</figure>
+We see that we always do no worse with the rewrite and that we do get
+performance gains of a factor of 2 increases
+</para>
+
+<para>
+Further things to explore include
+<itemizedlist>
+<listitem><para>increasing the value of B to see how this affects the timings</para>
+</listitem>
+<listitem><para>looking at system time and seeing how these change</para></listitem>
+<listitem><para>see when garbage collection occurs</para></listitem>
+</itemizedlist>
+</para>
+</section>
+
+<section>
+<title>Working with this document</title>
+<para>
+If we just want to extract the functions from this file and define them in R, we can 
+use 
+<r:code eval="false">
+ xmlSource("buffer.xml", xnodes = "//r:function")
+</r:code>
+(assuming buffer.xml is in the current working directory for the R session).
+You can also run the code and generate the code with
+<r:code eval="false">
+ xmlSource("buffer.xml", xnodes = "//r:function")
+</r:code>
+and run just the relevant pieces for the simulation with
+something like
+<r:code eval="false">
+ xmlSource("buffer.xml", ids = c("validate", "settings", "run2", "compare"))
+</r:code>
+</para>
+</section>
+
+<!-- <r:sessionInfo/> -->
+</article>

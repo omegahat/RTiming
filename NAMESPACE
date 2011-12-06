@@ -1,0 +1,9 @@
+useDynLib(RTiming)
+export(save, toc)
+export(timeCast)
+export(named, "named<-")
+
+export(testPageFaults, rusageListToDataFrame )
+
+
+

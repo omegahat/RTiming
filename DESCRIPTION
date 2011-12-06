@@ -1,0 +1,15 @@
+Package: RTiming
+Title: Timing test code for some aspects of the R interpreter
+Description:  This package is a start to collect some tests
+ for various aspects of the R interpreter such as the need to
+ duplicate/copy objects, how expensive it is to have code that conditionally
+ casts rather than first coerce to the target type, and so on.
+ The intent is to be able to run the tests and get the timings easily
+ on various different machines, platforms, optimization specifications, etc.
+Version: 0.1-0
+License: BSD
+Depends: RTimingTools
+LazyLoad: yes
+Author: Duncan Temple Lang
+Maintainer: Duncan Temple Lang <duncan@wald.ucdavis.edu>
+Packaged: Fri Jul 13 11:29:50 2007; duncan
